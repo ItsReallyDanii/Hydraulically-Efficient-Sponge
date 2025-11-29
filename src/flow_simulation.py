@@ -4,121 +4,109 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import torch
 import torch.nn.functional as F
-
-# ================================================================
-# Flow Simulation Configuration
-# ================================================================
+from tqdm import tqdm
+import pandas as pd
 
 RESULTS_DIR = "results/flow_simulation"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# Standard target size (consistent across datasets)
-TARGET_SIZE = (256, 256)
-
-
-# ================================================================
-# 1. Load and preprocess images (resize + grayscale + normalize)
-# ================================================================
 def load_grayscale_images(path):
-    """
-    Loads grayscale images, resizes them to a uniform shape,
-    normalizes intensities, enhances contrast, and thresholds
-    to separate open vs. solid regions.
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"🚫 Dataset folder not found: {path}")
 
     files = sorted([f for f in os.listdir(path) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-    if len(files) == 0:
-        raise RuntimeError(f"No image files found in {path}")
-
     imgs = []
+    shapes = set()
     for f in files:
         img = Image.open(os.path.join(path, f)).convert("L")
-
-        # ✅ Resize all to uniform target size
-        img = img.resize(TARGET_SIZE, Image.BICUBIC)
-
         arr = np.array(img, dtype=np.float32)
+        shapes.add(arr.shape)
+
+        # Normalize
         arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-
-        # Invert if pores are dark
-        if arr.mean() < 0.5:
-            arr = 1 - arr
-
-        # ✅ Enhance contrast
-        arr = np.clip((arr - 0.5) * 2.0 + 0.5, 0, 1)
-
-        # ✅ Binary threshold
-        arr = np.where(arr > 0.6, 1.0, 0.0)
-
         imgs.append(arr)
+
+    if len(shapes) > 1:
+        # Resize all to same shape
+        target_h, target_w = min(s[0] for s in shapes), min(s[1] for s in shapes)
+        resized_imgs = []
+        for arr in imgs:
+            arr = Image.fromarray((arr * 255).astype(np.uint8)).resize((target_w, target_h), Image.BILINEAR)
+            resized_imgs.append(np.array(arr, dtype=np.float32) / 255.0)
+        imgs = resized_imgs
 
     return np.stack(imgs, axis=0)
 
-
-# ================================================================
-# 2. Pseudo-physics flow solver
-# ================================================================
-def simulate_flow(img, iterations=300):
+def simulate_flow(img, steps=300, diffusivity=0.25):
     """
-    Compute a pseudo flow pressure field across the xylem structure.
-    img: normalized 2D array where 1 = open, 0 = solid
+    Diffusion-based pseudo-flow simulation.
+    Dark pixels = solid; light pixels = porous.
     """
-    h, w = img.shape
-    mask = torch.tensor(img, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-    mask = (mask > 0.4).float()
+    img_t = torch.tensor(img, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    h, w = img_t.shape[-2:]
 
-    # ✅ Inlet (top = 1), outlet (bottom = 0)
-    y = torch.linspace(1.0, 0.0, steps=h).view(1, 1, h, 1)
-    pressure = y.clone() * mask + (1 - mask) * 0.0
+    # Pressure initialized as uniform + small perturbation
+    pressure = torch.rand_like(img_t) * 0.1
 
-    # ✅ Relaxation for flow equilibrium
-    for _ in range(iterations):
-        avg = F.avg_pool2d(pressure, 3, stride=1, padding=1)
-        pressure = avg * mask + pressure * (1 - mask)
+    # Diffusion mask (higher intensity = more flow)
+    D = img_t * diffusivity
 
-    # ✅ Pressure gradient → flow rate
+    for _ in range(steps):
+        # 5-point Laplacian kernel
+        lap = (
+            F.pad(pressure, (0, 0, 1, 1))[..., 2:, :] +
+            F.pad(pressure, (0, 0, 1, 1))[..., :-2, :] +
+            F.pad(pressure, (1, 1, 0, 0))[..., :, 2:] +
+            F.pad(pressure, (1, 1, 0, 0))[..., :, :-2] -
+            4 * pressure
+        )
+        pressure = pressure + D * lap
+
+    # Compute gradient-based flow rate
     grad_y, grad_x = torch.gradient(pressure[0, 0])
-    flow_rate = (grad_y.abs() * mask[0, 0]).mean().item()
+    flow_rate = (grad_x.abs().mean() + grad_y.abs().mean()).item()
 
-    return pressure.squeeze().numpy(), flow_rate
+    # Compute pseudo metrics
+    mean_k = D.mean().item()
+    mean_dpdy = grad_y.abs().mean().item()
+    porosity = (img > 0.5).mean().item()
+    anisotropy = float(grad_x.abs().mean() / (grad_y.abs().mean() + 1e-8))
 
+    return pressure.squeeze().numpy(), {
+        "Mean_K": mean_k,
+        "Mean_dP/dy": mean_dpdy,
+        "FlowRate": flow_rate,
+        "Porosity": porosity,
+        "Anisotropy": anisotropy
+    }
 
-# ================================================================
-# 3. Dataset analysis
-# ================================================================
-def analyze_dataset_flow(name, path):
+def analyze_dataset_flow(name, path, tag):
     imgs = load_grayscale_images(path)
-    flow_eff = []
+    metrics = []
+    print(f"\n🌿 Simulating flow for {name} structures...")
+    for i, img in enumerate(tqdm(imgs, desc=name)):
+        pressure_map, m = simulate_flow(img)
+        m["Type"] = tag
+        metrics.append(m)
+        plt.imsave(os.path.join(RESULTS_DIR, f"flow_{name}_{i+1:03d}.png"), pressure_map, cmap="viridis")
 
-    for i, img in enumerate(imgs):
-        pressure_map, flow_rate = simulate_flow(img)
-        flow_eff.append(flow_rate)
-
-        # Optional visual save (for inspection)
-        plt.imsave(os.path.join(RESULTS_DIR, f"flow_{name}_{i+1}.png"),
-                   pressure_map, cmap="viridis")
-
-    mean_eff = np.mean(flow_eff)
+    df = pd.DataFrame(metrics)
+    mean_eff = df["FlowRate"].mean()
     print(f"🌊 Mean relative flow efficiency ({name}): {mean_eff:.4f}")
-    return mean_eff
+    return df, mean_eff
 
-
-# ================================================================
-# 4. Main Entry Point
-# ================================================================
 def main():
-    print("\n🌿 Simulating flow for Real Xylem structures...")
-    real_eff = analyze_dataset_flow("Real Xylem", "data/real_xylem")
+    real_df, real_eff = analyze_dataset_flow("Real Xylem", "data/real_xylem", "real")
+    synth_df, synth_eff = analyze_dataset_flow("Synthetic Xylem", "data/generated_microtubes", "synthetic")
 
-    print("\n🌿 Simulating flow for Synthetic Xylem structures...")
-    synth_eff = analyze_dataset_flow("Synthetic Xylem", "data/generated_microtubes")
+    df_all = pd.concat([real_df, synth_df], ignore_index=True)
+    os.makedirs("results/flow_metrics", exist_ok=True)
+    df_all.to_csv("results/flow_metrics/flow_metrics.csv", index=False)
+    print("\n💾 Flow metrics saved → results/flow_metrics/flow_metrics.csv")
 
     ratio = synth_eff / (real_eff + 1e-8)
     print(f"\n🧩 Synthetic vs Real Flow Ratio: {ratio:.2f}")
     print(f"✅ Flow simulation complete. Results in {RESULTS_DIR}")
-
 
 if __name__ == "__main__":
     main()
