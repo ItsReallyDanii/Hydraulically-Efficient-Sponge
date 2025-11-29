@@ -1,135 +1,228 @@
+"""
+train_physics_informed.py
+
+Physics-informed fine-tuning of the XylemAutoencoder using
+differentiable proxy metrics for porosity and flow.
+
+- Real-xylem images are used ONCE at startup to compute
+  target proxy values (porosity_proxy, flow_proxy).
+- During training, the autoencoder reconstructions are
+  penalized if their proxy metrics deviate from those targets.
+
+Evaluation with the full flow solver still happens separately
+via `flow_simulation.py` + `analyze_flow_metrics.py`.
+"""
+
 import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import pandas as pd
 from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 from src.model import XylemAutoencoder
-from src.flow_simulation_utils import compute_flow_metrics
+
+# -----------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------
 
 TARGET_SIZE = (256, 256)
+DEVICE = torch.device("cpu")   # Camber/Jupyter CPU
 
-def load_and_preprocess_images(path):
-    """Load and resize all grayscale images from a folder to consistent size."""
+REAL_XYLEM_DIRS = [
+    "data/real_xylem_preprocessed",
+    "data/real_xylem",
+]
+
+
+# -----------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------
+
+def load_images_as_tensor(path: str) -> torch.Tensor:
+    """
+    Load and resize all grayscale images from a folder to consistent size.
+    Returns [N,1,H,W] in [0,1].
+    """
     imgs = []
+    if not os.path.isdir(path):
+        return None
+
     for f in sorted(os.listdir(path)):
         if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif")):
             img = Image.open(os.path.join(path, f)).convert("L")
             img = img.resize(TARGET_SIZE, Image.BILINEAR)
             arr = np.array(img, dtype=np.float32) / 255.0
             imgs.append(torch.tensor(arr).unsqueeze(0))  # [1,H,W]
+
     if not imgs:
-        raise RuntimeError(f"No images found in {path}")
+        return None
+
     return torch.stack(imgs)  # [N,1,H,W]
 
-def safe_get(metrics, *possible_keys, default=0.0):
-    """Try multiple keys to safely extract a metric from the dict."""
-    for k in possible_keys:
-        if k in metrics and metrics[k] is not None:
-            return float(metrics[k])
-    return default
 
-def compute_physics_loss(batch_imgs, real_stats_path="results/flow_metrics/flow_metrics.csv"):
+def compute_proxy_targets_from_real() -> tuple[float, float]:
     """
-    Computes physics-informed loss using dynamically calibrated targets
-    from the real xylem dataset statistics.
+    Compute target proxy values (porosity_proxy, flow_proxy)
+    from real-xylem images using only differentiable-style ops.
+
+    Returns:
+        porosity_target, flow_target (floats)
     """
+    real_imgs = None
+    for d in REAL_XYLEM_DIRS:
+        real_imgs = load_images_as_tensor(d)
+        if real_imgs is not None:
+            print(f"📂 Loaded real xylem images from: {d}")
+            break
 
-    # --- 1️⃣ Try to load real-world reference means ---
-    K_target, P_target = 0.5, 0.9  # sensible defaults
-    if os.path.exists(real_stats_path):
-        import pandas as pd
-        try:
-            df = pd.read_csv(real_stats_path)
-            real_rows = df[df["type"].str.lower() == "real"] if "type" in df.columns else df
-            K_col = [c for c in df.columns if "mean" in c.lower() and "k" in c.lower()]
-            P_col = [c for c in df.columns if "porosity" in c.lower()]
-            if not real_rows.empty:
-                if K_col:
-                    K_target = float(real_rows[K_col[0]].mean())
-                if P_col:
-                    P_target = float(real_rows[P_col[0]].mean())
-        except Exception as e:
-            print(f"⚠️ Could not auto-calibrate targets: {e}")
+    if real_imgs is None:
+        # Fallback: reasonable defaults if real set is missing
+        print("⚠️ No real xylem images found; using default proxy targets.")
+        return 0.99, 0.01
 
-    # --- 2️⃣ Compute flow metrics for synthetic batch ---
-    K_list, P_list = [], []
-    for img_tensor in batch_imgs:
-        img_np = img_tensor.detach().cpu().squeeze().numpy()
-        try:
-            metrics = compute_flow_metrics(img_np)
-            keys = {k.lower(): v for k, v in metrics.items()}
-            K_val = keys.get("mean_k", keys.get("k", 0.0))
-            P_val = keys.get("porosity", 0.0)
-        except Exception as e:
-            print(f"⚠️ Flow metric computation failed: {e}")
-            K_val, P_val = 0.0, 0.0
-        K_list.append(K_val)
-        P_list.append(P_val)
+    real_imgs = real_imgs.to(DEVICE)
 
-    # --- 3️⃣ Compute mean physics stats & loss ---
-    K_mean, P_mean = np.mean(K_list), np.mean(P_list)
-    K_loss = (K_mean - K_target) ** 2
-    P_loss = (P_mean - P_target) ** 2
-    phys_loss = K_loss + P_loss
+    with torch.no_grad():
+        # Porosity proxy: mean brightness
+        porosity_proxy = real_imgs.mean()
 
-    return phys_loss, K_mean, P_mean
+        # Flow proxy: average gradient magnitude in x and y
+        grad_y = real_imgs[:, :, 1:, :] - real_imgs[:, :, :-1, :]
+        grad_x = real_imgs[:, :, :, 1:] - real_imgs[:, :, :, :-1]
+        flow_proxy = (grad_x.abs().mean() + grad_y.abs().mean())
+
+    porosity_target = float(porosity_proxy.item())
+    flow_target = float(flow_proxy.item())
+
+    print(f"🎯 Proxy targets from real xylem:")
+    print(f"   Porosity_proxy_target ≈ {porosity_target:.6f}")
+    print(f"   Flow_proxy_target     ≈ {flow_target:.6f}")
+
+    return porosity_target, flow_target
+
+
+def physics_proxy_loss(
+    recon: torch.Tensor,
+    porosity_target: float,
+    flow_target: float,
+):
+    """
+    Differentiable physics proxy loss computed directly on reconstructions.
+
+    Args:
+        recon: [N,1,H,W] tensor in [0,1]
+        porosity_target: scalar target for mean brightness
+        flow_target:     scalar target for gradient magnitude proxy
+
+    Returns:
+        phys_loss: torch scalar with gradient
+        porosity_proxy_val: float (for logging)
+    """
+    # Porosity proxy: mean brightness
+    porosity_proxy = recon.mean()
+
+    # Flow proxy: gradient magnitude
+    grad_y = recon[:, :, 1:, :] - recon[:, :, :-1, :]
+    grad_x = recon[:, :, :, 1:] - recon[:, :, :, :-1]
+    flow_proxy = (grad_x.abs().mean() + grad_y.abs().mean())
+
+    eps = 1e-8
+    p_loss = ((porosity_proxy - porosity_target) / (porosity_target + eps)) ** 2
+    f_loss = ((flow_proxy - flow_target) / (flow_target + eps)) ** 2
+
+    # Weights can be tuned; start symmetric
+    w_p = 1.0
+    w_f = 1.0
+
+    phys_loss = w_p * p_loss + w_f * f_loss
+
+    return phys_loss, float(porosity_proxy.item())
+
+
+# -----------------------------------------------------------------------
+# Main training loop
+# -----------------------------------------------------------------------
 
 def main():
-    print("🌱 Physics-informed fine-tuning started on cpu")
+    print("🌱 Physics-proxy fine-tuning started on", DEVICE)
 
-    # Load model
-    model = XylemAutoencoder()
-    model.load_state_dict(torch.load("results/model_hybrid.pth", map_location="cpu"))
+    # 1) Load model
+    model = XylemAutoencoder().to(DEVICE)
+    model.load_state_dict(torch.load("results/model_hybrid.pth", map_location=DEVICE))
     model.train()
 
-    # Load data
+    # 2) Compute proxy targets from real xylem
+    porosity_target, flow_target = compute_proxy_targets_from_real()
+
+    # 3) Load synthetic training data
     data_path = "data/generated_microtubes"
-    imgs = load_and_preprocess_images(data_path)
-    print(f"🧩 Loaded {len(imgs)} generated structures → resized to {TARGET_SIZE}")
+    synth_imgs = load_images_as_tensor(data_path)
+    if synth_imgs is None:
+        raise RuntimeError(f"No synthetic images found in {data_path}")
+    synth_imgs = synth_imgs.to(DEVICE)
+    print(f"🧩 Loaded {len(synth_imgs)} generated structures → resized to {TARGET_SIZE}")
 
     recon_loss_fn = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     logs = []
+
     for epoch in range(1, 101):
         optimizer.zero_grad()
-        recon, _ = model(imgs)
-        recon_loss = recon_loss_fn(recon, imgs)
 
-        phys_loss, K_mean, P_mean = compute_physics_loss(recon)
+        recon, _ = model(synth_imgs)
+        recon_loss = recon_loss_fn(recon, synth_imgs)
 
-        # Dynamic physics weighting
-        weight_phys = 0.5 + 5 * (1 - np.exp(-epoch / 30))
+        phys_loss, porosity_proxy_val = physics_proxy_loss(
+            recon,
+            porosity_target=porosity_target,
+            flow_target=flow_target,
+        )
+
+        # Dynamic physics weighting (same schedule idea as before)
+        weight_phys = 0.5 + 5 * (1 - np.exp(-epoch / 30.0))
         total_loss = recon_loss + weight_phys * phys_loss
 
         total_loss.backward()
         optimizer.step()
 
-        grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
+        # Gradient norm for logging
+        grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.norm().item()
 
         logs.append({
             "epoch": epoch,
             "total": total_loss.item(),
             "recon": recon_loss.item(),
             "phys": phys_loss.item(),
-            "K": K_mean,
-            "Porosity": P_mean,
-            "GradNorm": grad_norm
+            "PorosityProxy": porosity_proxy_val,
+            "GradNorm": grad_norm,
         })
 
         if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/100 | Total: {total_loss.item():.5f} | Recon: {recon_loss.item():.5f} | "
-                  f"Phys: {phys_loss.item():.5f} | K: {K_mean:.5f} | Porosity: {P_mean:.5f} | GradNorm: {grad_norm:.2e}")
+            print(
+                f"Epoch {epoch:3d}/100 | "
+                f"Total: {total_loss.item():.5f} | "
+                f"Recon: {recon_loss.item():.5f} | "
+                f"Phys: {phys_loss.item():.5f} | "
+                f"PorosityProxy: {porosity_proxy_val:.5f} | "
+                f"GradNorm: {grad_norm:.2e}"
+            )
 
-    # Save results
+    # 4) Save results
     os.makedirs("results", exist_ok=True)
     torch.save(model.state_dict(), "results/model_physics_tuned.pth")
     pd.DataFrame(logs).to_csv("results/physics_training_log.csv", index=False)
-    print("✅ Physics-informed fine-tuning complete.")
+
+    print("✅ Physics-proxy fine-tuning complete.")
     print("💾 Model saved → results/model_physics_tuned.pth")
     print("🧾 Training log saved → results/physics_training_log.csv")
+
 
 if __name__ == "__main__":
     main()
