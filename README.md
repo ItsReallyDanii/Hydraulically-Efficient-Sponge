@@ -42,3 +42,23 @@ synthetic_tree_physics/
 
 ![Diagram]("https://imgur.com/a/jOSHWjj")
 
+---
+
+## 🌿 Morphological Analytics
+
+Once the Synthetic Cambium Growth loop has completed, we can visualize how the model adapts its vascular structure to optimize flow.
+
+### Conductivity Improvement
+As the latent cambium updates over time, the generated microvascular geometry becomes increasingly efficient at transporting simulated water.
+
+![](results/morpho_analysis/conductivity_curve.png)
+
+### Morphological Evolution
+Below is a timeline of the evolving structures — each frame representing a single cambial feedback iteration.  
+You can see the gradual emergence of more continuous, pressure-optimized channels — synthetic xylem in action.
+
+![](results/morpho_analysis/morphology_timeline.png)
+
+*(Optional)* If latent trajectories were recorded, `latent_drift.png` shows how the system’s internal “genetic code” migrates through its learned material design space.
+
+---
