@@ -62,3 +62,34 @@ You can see the gradual emergence of more continuous, pressure-optimized channel
 *(Optional)* If latent trajectories were recorded, `latent_drift.png` shows how the system’s internal “genetic code” migrates through its learned material design space.
 
 ---
+---
+
+## 🌳 Synthetic Cambium Feedback Loop (Architecture Overview)
+
+The system models a self-optimizing vascular growth process inspired by real trees.
+
+1. **Latent Cambium (`z`)**  
+   Acts as the “genome” of the structure — a compact numerical code representing a potential microvascular design.
+
+2. **Decoder → Synthetic Xylem**  
+   The autoencoder’s decoder transforms `z` into a 2D structure image.  
+   This corresponds to *newly formed vascular tissue* in the biological analogy.
+
+3. **Flow Simulation**  
+   A physics engine simulates how water (or sap) would move through the structure, producing:
+   - Pressure field
+   - Conductivity metric
+
+4. **Cambial Feedback (Growth Rule)**  
+   Pressure gradients act as “growth signals.”  
+   The model adjusts its latent code:  
+   `z ← z + α * ∇(flow_efficiency)`  
+   — reinforcing channels that improve hydraulic performance.
+
+5. **Morphological Analytics**  
+   Over many iterations, the model’s vascular geometry evolves —  
+   conductivity rises, channels self-organize, and the synthetic “tree” learns how to grow.
+
+![](results/architecture_overview.png)
+
+---
