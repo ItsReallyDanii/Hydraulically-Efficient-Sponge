@@ -1,85 +1,79 @@
 """
 train_surrogate.py
-------------------
-Train a small CNN surrogate to approximate the flow solver:
 
-    image (1x256x256) → [Mean_K, Mean_dP/dy, FlowRate, Porosity, Anisotropy]
+Train a CNN surrogate that maps xylem images → solver physics metrics:
+    [Mean_K, Mean_dP/dy, FlowRate, Porosity, Anisotropy]
 
-The trained weights are saved as:
-    results/physics_surrogate.pth
-
-`PhysicsSurrogateCNN` is defined at module level so it can be imported from
-other scripts, e.g.:
-
-    from src.train_surrogate import PhysicsSurrogateCNN
+It consumes the dataset built by build_surrogate_dataset.py:
+    results/surrogate_dataset.pt
+        {
+          "images":        FloatTensor [N, 1, 256, 256] in [0,1]
+          "metrics":       FloatTensor [N, 5]
+          "metric_names":  list[str] length 5
+        }
 """
 
 import os
 import torch
-from torch import nn
-from torch.utils.data import TensorDataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+
+DEVICE = torch.device("cpu")
 
 
-# ============================================================
-#  Model definition — this is what train_physics_informed_v03
-#  expects to import as the surrogate.
-# ============================================================
-
+# -------------------------------------------------------------------
+# Surrogate model: small CNN → 5 physics metrics
+# -------------------------------------------------------------------
 class PhysicsSurrogateCNN(nn.Module):
-    """
-    Simple convolutional regressor:
-        1x256x256 → conv stack → flatten → FC → 5 metrics
-    """
-
-    def __init__(self):
+    def __init__(self, n_outputs: int = 5):
         super().__init__()
-
+        # Input images: [B, 1, 256, 256]
         self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2),  # 256 → 128
+            nn.Conv2d(1, 16, kernel_size=5, padding=2),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                                       # 128 → 64
+            nn.MaxPool2d(2),          # 1x256x256 → 16x128x128
 
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1), # 64 → 64
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                                       # 64 → 32
+            nn.MaxPool2d(2),          # 32x128x128 → 32x64x64
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1), # 32 → 32
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                                       # 32 → 16
+            nn.MaxPool2d(2),          # 64x64x64 → 64x32x32
         )
-
-        # 64 channels * 16 * 16 = 16384 features
-        flat_dim = 64 * 16 * 16
 
         self.head = nn.Sequential(
-            nn.Linear(flat_dim, 256),
+            nn.Flatten(),             # 64 * 32 * 32 = 65536
+            nn.Linear(64 * 32 * 32, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 5)   # [Mean_K, Mean_dP/dy, FlowRate, Porosity, Anisotropy]
+            nn.Linear(128, n_outputs),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-        x = x.view(x.size(0), -1)
-        return self.head(x)
+        x = self.head(x)
+        return x
 
 
-# ============================================================
-#  Training script
-# ============================================================
-
-def main():
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🧪 Training physics surrogate on {DEVICE}")
-
-    dataset_path = "results/surrogate_dataset.pt"
-    if not os.path.exists(dataset_path):
+# -------------------------------------------------------------------
+# Dataset loader
+# -------------------------------------------------------------------
+def load_surrogate_dataset(path: str = "results/surrogate_dataset.pt"):
+    """
+    Load the saved surrogate dataset:
+        images: [N, 1, 256, 256]
+        metrics: [N, 5]
+        metric_names: list of 5 strings
+    """
+    if not os.path.exists(path):
         raise FileNotFoundError(
-            f"{dataset_path} not found. Run build_surrogate_dataset.py first."
+            f"Surrogate dataset not found at {path}. "
+            "Run build_surrogate_dataset.py first."
         )
 
-    data = torch.load(dataset_path, map_location=DEVICE)
-    images = data["images"].to(DEVICE)          # [N, 1, 256, 256]
-    metrics = data["metrics"].to(DEVICE)        # [N, 5]
+    data = torch.load(path, map_location=DEVICE)
+    images = data["images"].float().to(DEVICE)
+    metrics = data["metrics"].float().to(DEVICE)
     metric_names = data.get("metric_names", ["Mean_K", "Mean_dP/dy", "FlowRate", "Porosity", "Anisotropy"])
 
     print("✅ Loaded surrogate dataset:")
@@ -87,73 +81,63 @@ def main():
     print(f"   metrics: {metrics.shape}")
     print(f"   metric_names: {metric_names}")
 
-    # ----- train/val split -----
-    N = images.size(0)
-    n_val = max(1, int(0.2 * N))
-    n_train = N - n_val
+    return images, metrics, metric_names
 
-    train_imgs, val_imgs = torch.split(images, [n_train, n_val])
-    train_y,   val_y   = torch.split(metrics, [n_train, n_val])
 
-    train_loader = DataLoader(
-        TensorDataset(train_imgs, train_y),
-        batch_size=16,
-        shuffle=True
-    )
-    val_loader = DataLoader(
-        TensorDataset(val_imgs, val_y),
-        batch_size=16,
-        shuffle=False
-    )
+# -------------------------------------------------------------------
+# Training loop
+# -------------------------------------------------------------------
+def main():
+    print("🧪 Training physics surrogate on", DEVICE)
 
-    model = PhysicsSurrogateCNN().to(DEVICE)
+    images, metrics, metric_names = load_surrogate_dataset()
+
+    # Simple train/val split
+    N = images.shape[0]
+    n_train = int(0.8 * N)
+    train_imgs = images[:n_train]
+    train_y = metrics[:n_train]
+    val_imgs = images[n_train:]
+    val_y = metrics[n_train:]
+
+    model = PhysicsSurrogateCNN(n_outputs=metrics.shape[1]).to(DEVICE)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-    os.makedirs("results", exist_ok=True)
+    num_epochs = 60
     best_val = float("inf")
 
-    EPOCHS = 60
-    for epoch in range(1, EPOCHS + 1):
-        # ----- train -----
+    for epoch in range(1, num_epochs + 1):
+        # ---- train ----
         model.train()
-        train_loss = 0.0
-        for x, y in train_loader:
-            optimizer.zero_grad()
-            pred = model(x)
-            loss = criterion(pred, y)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * x.size(0)
+        optimizer.zero_grad()
 
-        train_loss /= n_train
+        pred_train = model(train_imgs)
+        loss_train = criterion(pred_train, train_y)
+        loss_train.backward()
+        optimizer.step()
 
-        # ----- validate -----
+        # ---- val ----
         model.eval()
-        val_loss = 0.0
         with torch.no_grad():
-            for x, y in val_loader:
-                pred = model(x)
-                loss = criterion(pred, y)
-                val_loss += loss.item() * x.size(0)
+            pred_val = model(val_imgs)
+            loss_val = criterion(pred_val, val_y)
 
-        val_loss /= n_val
-
-        if val_loss < best_val:
-            best_val = val_loss
+        if loss_val.item() < best_val:
+            best_val = loss_val.item()
+            os.makedirs("results", exist_ok=True)
             torch.save(model.state_dict(), "results/physics_surrogate.pth")
-            print(
-                f"Epoch {epoch:2d}/{EPOCHS} | "
-                f"Train MSE: {train_loss:.6f} | Val MSE: {val_loss:.6f}\n"
-                f"   ✅ New best val loss, model saved → results/physics_surrogate.pth"
-            )
+            tag = "   ✅ New best val loss, model saved → results/physics_surrogate.pth"
         else:
-            print(
-                f"Epoch {epoch:2d}/{EPOCHS} | "
-                f"Train MSE: {train_loss:.6f} | Val MSE: {val_loss:.6f}"
-            )
+            tag = ""
 
-    print(f"🏁 Surrogate training complete. Best val MSE: {best_val:.6f}")
+        print(
+            f"Epoch {epoch:2d}/{num_epochs:2d} | "
+            f"Train MSE: {loss_train.item():.6f} | "
+            f"Val MSE: {loss_val.item():.6f}{tag}"
+        )
+
+    print("🏁 Surrogate training complete. Best val MSE:", best_val)
 
 
 if __name__ == "__main__":

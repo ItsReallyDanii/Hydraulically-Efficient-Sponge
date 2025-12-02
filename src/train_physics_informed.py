@@ -1,5 +1,5 @@
 """
-train_physics_informed.py  (v0.2 – surrogate-based)
+train_physics_informed.py  (v0.2 – surrogate-based, aligned with train_surrogate)
 
 Fine-tune the XylemAutoencoder using a learned physics surrogate.
 
@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from src.model import XylemAutoencoder
+from src.train_surrogate import PhysicsSurrogateCNN  # <-- single source of truth
 
 DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
@@ -35,7 +36,7 @@ TARGET_SIZE = (256, 256)
 # ----------------------------------------------------
 # Data loading
 # ----------------------------------------------------
-def load_and_preprocess_images(path):
+def load_and_preprocess_images(path: str) -> torch.Tensor:
     """Load and resize all grayscale images from a folder to consistent size."""
     imgs = []
     for f in sorted(os.listdir(path)):
@@ -50,41 +51,9 @@ def load_and_preprocess_images(path):
 
 
 # ----------------------------------------------------
-# Surrogate model (must match train_physics_surrogate.py)
-# ----------------------------------------------------
-class PhysicsSurrogateCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),   # 256 → 128
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # 128 → 64
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 64 → 32
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 32 → 16
-            nn.ReLU(inplace=True),
-        )
-
-        # 🔧 IMPORTANT: match the architecture used during surrogate training
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 16 * 16, 256),  # 32768 → 256
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 5),             # 256 → 5
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.head(x)
-        return x
-
-
-
-# ----------------------------------------------------
 # Load real-physics targets from flow_metrics.csv
 # ----------------------------------------------------
-def load_real_targets(flow_metrics_path="results/flow_metrics/flow_metrics.csv"):
+def load_real_targets(flow_metrics_path: str = "results/flow_metrics/flow_metrics.csv"):
     """
     Reads solver stats and returns mean targets for:
     [Mean_K, Mean_dP/dy, FlowRate, Porosity, Anisotropy] for REAL samples.
@@ -92,7 +61,7 @@ def load_real_targets(flow_metrics_path="results/flow_metrics/flow_metrics.csv")
     if not os.path.exists(flow_metrics_path):
         raise FileNotFoundError(
             f"Flow metrics file not found at {flow_metrics_path}. "
-            "Run flow_simulation.py + flow_metrics_export first."
+            "Run flow_simulation.py first."
         )
 
     df = pd.read_csv(flow_metrics_path)
@@ -125,7 +94,7 @@ def main():
     ae.load_state_dict(torch.load("results/model_hybrid.pth", map_location=DEVICE))
     ae.train()
 
-    # 2) Load fixed surrogate
+    # 2) Load fixed surrogate (same arch as in train_surrogate.py)
     surrogate = PhysicsSurrogateCNN().to(DEVICE)
     surrogate.load_state_dict(torch.load("results/physics_surrogate.pth", map_location=DEVICE))
     surrogate.eval()
@@ -176,7 +145,7 @@ def main():
                 grad_norm += p.grad.norm().item()
         grad_norm = float(grad_norm)
 
-        # Log
+        # Log row
         log_row = {
             "epoch": epoch,
             "total": float(total_loss.item()),
